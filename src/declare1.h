@@ -85,8 +85,12 @@ c    Declarations for Main file
       real rout(MAXPARAM,MAX_WIDTH), period1(4,MAX_PROB), D25,
      1     MinRrup(MAX_FLT), xCostBins(MAX_Xcost), r_horiz, MinSeismo_temp,
      2     HazBinsX(MAX_Xcost,MAX_PROB,MAX_INTEN), rupArea, minlat,
-     3     HazBins(MAX_MAG,MAX_DIST,MAX_EPS,MAX_PROB,MAX_INTEN),
      4     magBins(MAX_MAG), distBins(MAX_DIST), epsBins(MAX_EPS)
+C *** PRECISION EDIT: HazBins (deaggregation bins) accumulated in real*8.
+C     In single precision, millions of small additions per bin lost up to ~13%.
+cPR   (was declared  real HazBins(...)  in the list above)
+      real*8 HazBins(MAX_MAG,MAX_DIST,MAX_EPS,MAX_PROB,MAX_INTEN)
+C *** END PRECISION EDIT
       real gmScale(MAX_PROB,4,MAX_ATTEN), gm_wt(MAX_PROB,4,MAX_ATTEN),
      1     sigvaradd(MAX_PROB,4,MAX_ATTEN), rupWidth, x0, y0, z0,
      2     probAct(MAX_FLT), pWidth, pArea, distRup, distJB,
@@ -123,6 +127,31 @@ c    Declarations for Main file
       real table_m(MAX_EAST), table_r(MAX_EAST), table_lnSA(17,MAX_FREQ,MAX_EAST)
 
       common/GMTable/ iflagRead, table_m, table_r, table_lnSA, nsc
+
+C *** SPEEDUP EDIT (Stage 1): GMM cache and zero-pMag skip declarations
+C     Per-rupture cache of GMM results, keyed by jcalc (median) and scalc (sigma).
+C     Valid within one (rupture, ftype, period); reset before the iAtten loop.
+      integer MAX_GMCACHE
+      parameter (MAX_GMCACHE=100)
+      integer nCacheMed, nCacheSig, iCache,
+     1        cacheMedJ(MAX_GMCACHE), cacheSigJ(MAX_GMCACHE)
+      real cacheMedLn(MAX_GMCACHE), cacheMedSg(MAX_GMCACHE),
+     1     cacheSigSg(MAX_GMCACHE)
+      logical allZeroMag
+C *** END SPEEDUP EDIT
+
+C *** SPEEDUP EDIT (Stage 2): recurrence-loop hoist work arrays
+C     hRate(iParam)   = rate*pMag*probAct for the current magnitude
+C     hWtRate(iFtype) = sum over iParam of wt*al_segWt*segwt1*hRate
+C     hWtP1(iFtype)   = sum over iParam of wt*pMag (for the p1_sum check)
+C     hG              = sum over ruptures of pRock*pAleat, per test level,
+C                       period, GMM branch and mechanism (current magnitude)
+C     hHsum(jInten)   = epsilon-independent weighted hazard for current rupture
+      real*8 hWtRate(MAX_FTYPE), hWtP1(MAX_FTYPE), hRate(MAXPARAM),
+     1       hPAleat, hQ, hH, hHw, hHsum(MAX_INTEN),
+     2       hG(MAX_INTEN,MAX_PROB,MAX_ATTEN,MAX_FTYPE)
+      logical hHoist, hUsed
+C *** END SPEEDUP EDIT
 
       character*80 fName(MAX_FLT), attenName, file1, file2,
      1             sigmaName, filebmode

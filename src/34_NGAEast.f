@@ -48,7 +48,7 @@ c     write the model number integer into a string
 c     read in the NGA-East Tables
       if (iflagRead(imod) .eq. 0) then
         do ifreq=1,MAX_FREQ
-          table = 'H.7.1_Median_Models/'//TRIM(freq_ch(ifreq))//'/NGA_East_Model_'//trim(adjustl(number))//'.csv'
+          table = '../../../../common/H.7.1_Median_Models/'//TRIM(freq_ch(ifreq))//'/NGA_East_Model_'//trim(adjustl(number))//'.csv'
           open (404,file=table,status='old')
           read (404,*) dummy
           do isc=1,nsc

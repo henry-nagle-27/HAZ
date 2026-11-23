@@ -69,8 +69,8 @@ c --------------------------------------------------------------
 
       implicit none
       include 'pfrisk.h'
-
-      real HazBins( MAX_MAG, MAX_DIST, MAX_EPS,MAX_PROB, MAX_INTEN )
+C *** PRECISION EDIT: HazBins is now double precision (was  real HazBins(...) )
+      real*8 HazBins( MAX_MAG, MAX_DIST, MAX_EPS,MAX_PROB, MAX_INTEN )
       integer i1, i2, i2b, i3, i4
 
       do 90 i1 = 1, MAX_MAG
@@ -205,17 +205,20 @@ c -------------------------------------------------------------
       real*8 tempHaz(MAXPARAM,MAX_INTEN, MAX_PROB, MAX_ATTEN,MAX_FTYPE)
       integer iParam, iInten, iProb, iAtten, iFtype
 
-      do iParam=1,MAXPARAM
-          do iInten=1,MAX_INTEN
-            do iProb=1,MAX_PROB
-              do iAtten=1,MAX_ATTEN
-                do iFtype=1,MAX_FTYPE
-                  tempHaz(iParam,iInten,iProb,iAtten,iFtype) = 0.0
-                enddo
+C *** SPEEDUP EDIT (Stage 1): loop order changed so the first (fastest-varying)
+C     array index is innermost; values set are identical.
+      do iFtype=1,MAX_FTYPE
+        do iAtten=1,MAX_ATTEN
+          do iProb=1,MAX_PROB
+            do iInten=1,MAX_INTEN
+              do iParam=1,MAXPARAM
+                tempHaz(iParam,iInten,iProb,iAtten,iFtype) = 0.0
               enddo
             enddo
           enddo
+        enddo
       enddo
+C *** END SPEEDUP EDIT
       return
       end
 

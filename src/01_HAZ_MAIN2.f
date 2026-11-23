@@ -71,6 +71,11 @@ c     read fault File
      7     DistS7, DipS7, mechS7, ncountS7, version, VarXstepFlag, VarYstepFlag,
      8     distmaxType)
 
+C *** SPEEDUP EDIT (Stage 2): hoist accumulator starts at zero; it is reset
+C     to zero entry by entry each time it is applied (end of each magnitude)
+      hG = 0.d0
+C *** END SPEEDUP EDIT
+
 c     Loop Over Number of Sites
       read (13,*,err=2100) nSite
       do 1000 iSite = 1, nSite
@@ -226,6 +231,51 @@ c         using the magnitude pdf for each parameter variation
      1                    iFlt, iFltWidth, pMag, nParamVar, nWidth, MagRecur,
      2                    mpdf_param, ExpMeanMo, CharMeanMo, rup1_flag)
 
+C *** SPEEDUP EDIT (Stage 1, zero-pMag magnitude skip)
+C     If pMag is zero for every epistemic branch at this magnitude, every
+C     hazard and deaggregation term below is zero. The rupture geometry and
+C     distance loops still run (so minimum-distance outputs are unchanged);
+C     only the ground-motion and accumulation loops are skipped.
+          allZeroMag = .false.
+          if (sourceType(iFlt) .ne. 7) then
+            allZeroMag = .true.
+            do iParam=1,nParamVar(iFlt,iFltWidth)
+              if ( pMag(iParam,iFltWidth) .ne. 0. ) allZeroMag = .false.
+            enddo
+          endif
+C *** END SPEEDUP EDIT
+
+C *** SPEEDUP EDIT (Stage 2, recurrence-loop hoist): per-magnitude branch sums
+C     The marginal rate in the original inner loop is
+C        mHaz = rate(iParam)*pRock*p1*probAct,  p1 = pMag(iParam)*pAleat,
+C     where pAleat (rupture area/width, location, hypocenter and synchronous-
+C     rupture probabilities) does not depend on iParam. Sums over iParam are
+C     therefore formed once per magnitude here, and the inner loop over iParam
+C     is replaced by these sums. Source type 7 and PC runs keep the original loop.
+          if (sourceType(iFlt) .ne. 7) then
+            do iParam=1,nParamVar(iFlt,iFltWidth)
+              hRate(iParam) = dble(rate(iParam,iFltWidth))
+     1                      * dble(pMag(iParam,iFltWidth)) * dble(probAct(iFlt))
+            enddo
+            do iFtype=1,nFtype(iFlt)
+              hWtRate(iFtype) = 0.d0
+              hWtP1(iFtype) = 0.d0
+              do iParam=1,nParamVar(iFlt,iFltWidth)
+                wt = RateParamWt(iFlt,iParam,iFltWidth)
+     1             * magRecurWt(iFlt,iParam,iFltWidth)
+     2             * faultWidthWt(iFlt,iFltWidth)
+     2             * maxMagWt(iFlt,iParam,iFltWidth)
+     2             * ftype_wt(iFlt,iFtype)
+                wtout(iFlt,iParam,iFltWidth,iFtype) = wt
+                hWtP1(iFtype) = hWtP1(iFtype) + wt*pMag(iParam,iFltWidth)
+                hWtRate(iFtype) = hWtRate(iFtype)
+     1                + wt*al_segWt(iFlt)*segwt1(iFlt)*hRate(iParam)
+              enddo
+            enddo
+          endif
+          hUsed = .false.
+C *** END SPEEDUP EDIT
+
 c         Echo magnitude integration step over magnitude to the screen
 c         as a check of the programs progress.
           if (sourceType(iFlt) .ne. 7) then
@@ -318,12 +368,25 @@ c             (max distance for this source's max distance type)
 c             Set the distance bin for de-aggregation (using rupture distance)
               call S23_SetBin ( nDistBins, distBins, distRup,iDistBin)
 
+C *** SPEEDUP EDIT (Stage 1, zero-pMag magnitude skip)
+              if ( allZeroMag ) goto 600
+C *** END SPEEDUP EDIT
+
 c             Loop over ftypes
               do 561 iFtype=1,nFtype(iFlt)
 
 c             Loop Over Number of Problems (e.g. spectral periods)
               do 560 iProb=1,nProb
                jType = attenType(iFlt)
+C *** SPEEDUP EDIT (Stage 1, GMM cache)
+               nCacheMed = 0
+               nCacheSig = 0
+C *** END SPEEDUP EDIT
+C *** SPEEDUP EDIT (Stage 2): per-rupture epsilon-independent hazard sum
+               do jInten=1,nInten(iProb)
+                 hHsum(jInten) = 0.d0
+               enddo
+C *** END SPEEDUP EDIT
                do 550 iAtten = 1,nAtten(iProb,jType)
 
 c               Check for negative jcalc values which will set the corresponding sigma to
@@ -345,6 +408,17 @@ C                  Check for either fixed sigma value (scalc1<0) or other sigma 
 
 c              Compute the median and sigma of the ground motions
                if (sourceType(iFlt) .ne. 7) then
+C *** SPEEDUP EDIT (Stage 1, GMM cache): reuse the median/sigma already computed
+C     for this jcalc on this rupture. S11_meanInten results depend only on
+C     jcalc and the rupture/site inputs (iAtten, iProb, jType are used only to
+C     store period1), so the cached values are identical to a fresh call.
+                 do iCache = 1, nCacheMed
+                   if ( cacheMedJ(iCache) .eq. jcalc1 ) then
+                     lgInten = cacheMedLn(iCache)
+                     sigmaY  = cacheMedSg(iCache)
+                     goto 5101
+                   endif
+                 enddo
                  call S11_meanInten ( distRup, distJB, distSeismo,
      1               HWFlag, mag, jcalc1, specT(iProb),
      2               lgInten, sigmaY, ftype(iFlt,iFtype), attenName, period1,
@@ -352,6 +426,14 @@ c              Compute the median and sigma of the ground motions
      4               disthypo, depthvs10, depthvs15, D25, tau,
      5               zTOR, theta_site, RupWidth, vs30_class, forearc, Rx, phi,
      6               cfcoefrrup, cfcoefrjb, Ry0 )
+                 if ( nCacheMed .lt. MAX_GMCACHE ) then
+                   nCacheMed = nCacheMed + 1
+                   cacheMedJ(nCacheMed)  = jcalc1
+                   cacheMedLn(nCacheMed) = lgInten
+                   cacheMedSg(nCacheMed) = sigmaY
+                 endif
+ 5101            continue
+C *** END SPEEDUP EDIT
                elseif (sourceType(iFlt) .eq. 7) then
                  call S11_meanInten ( distRup, distJB, distSeismo,
      1               HWFlag, mag, jcalc1, specT(iProb),
@@ -400,6 +482,13 @@ c                 Compute SRSS of median
 C               Second call get GMPE for different sigma model
                 if (sigflag .eq. 1) then
                   if (sourceType(iFlt) .ne. 7) then
+C *** SPEEDUP EDIT (Stage 1, GMM cache): reuse sigma already computed for this scalc
+                    do iCache = 1, nCacheSig
+                      if ( cacheSigJ(iCache) .eq. scalc1 ) then
+                        sigmaY = cacheSigSg(iCache)
+                        goto 5102
+                      endif
+                    enddo
                     call S11_meanInten ( distRup, distJB, distSeismo,
      1               hwflag, mag, scalc1, specT(iProb),
      2               temp, sigmaY, ftype(iFlt,iFtype), sigmaName, period1,
@@ -407,6 +496,13 @@ C               Second call get GMPE for different sigma model
      4               disthypo, depthvs10, depthvs15, D25, tau,
      5               zTOR, theta_site, RupWidth, vs30_class, forearc, Rx, phi,
      6               cfcoefrrup, cfcoefrjb, Ry0 )
+                    if ( nCacheSig .lt. MAX_GMCACHE ) then
+                      nCacheSig = nCacheSig + 1
+                      cacheSigJ(nCacheSig)  = scalc1
+                      cacheSigSg(nCacheSig) = sigmaY
+                    endif
+ 5102               continue
+C *** END SPEEDUP EDIT
                   elseif (sourceType(iFlt) .eq. 7) then
                     call S11_meanInten ( distRup, distJB, distSeismo,
      1               HWFlag, mag, jcalc1, specT(iProb),
@@ -495,6 +591,12 @@ c                   Add directivity to median and sigma
                     sigmaTotal = sqrt( t1 )
                   endif
 
+C *** SPEEDUP EDIT (Stage 2): aleatory probability of this rupture without pMag
+                  hPAleat = dble(pArea)*dble(pWidth)*dble(pLocX)*dble(pLocY(iLocY))
+     1                    *dble(phypoX)*dble(phypoZ)*dble(probSyn)*dble(synwt(iFlt,isyn))
+                  hHoist = ( sourceType(iFlt) .ne. 7 .and. PCflag(iProb) .eq. 0 )
+C *** END SPEEDUP EDIT
+
 c                  Loop over test ground motion values
                    do 510 jInten = 1, nInten(iProb)
 
@@ -528,6 +630,34 @@ c                   Compute number of standard deviations (epsilon) to reach tes
 c                   Set bin for epsilon deaggregation
                     call S23_SetBin_Eps ( nEpsBins, epsBins, epsilon1, iepsBin)
 
+C *** SPEEDUP EDIT (Stage 2): replacement for the iParam loop (see per-magnitude sums)
+                    if ( hHoist ) then
+                      hQ = prock*hPAleat
+C                     branch-resolved part: applied to tempHaz/tempHaz1 per magnitude
+                      hG(jInten,iProb,iAtten,iFtype) = hG(jInten,iProb,iAtten,iFtype) + hQ
+                      hUsed = .true.
+C                     p1_sum check, same condition as the original loop
+                      if ( iAtten .eq. 1 .and. iProb .eq. 1 .and. jInten .eq. 1 ) then
+                        p1_sum = p1_sum + hWtP1(iFtype)*hPAleat
+                      endif
+C                     hH = sum over iParam of mHaz*wt;  hHw = sum of mHaz*wt1
+                      hH  = hQ*hWtRate(iFtype)
+                      hHw = hH*gm_wt(iProb,jType,iAtten)
+C                     GMC tornado sum
+                      tempHaz2(jType,jInten,iProb,iAtten) = hH
+     1                        + tempHaz2(jType,jInten,iProb,iAtten)
+C                     epsilon-dependent deaggregation terms
+                      HazBins(iMagBin,iDistBin,iEpsBin,iProb,jInten) =
+C *** PRECISION EDIT: add in double precision (was  + real(hHw) )
+     1                      HazBins(iMagBin,iDistBin,iEpsBin,iProb,jInten) + hHw
+                      e_bar(iProb,jInten) = e_bar(iProb,jInten) + hHw*epsilon1
+                      e_bar_s(iFlt,iProb,jInten) = e_bar_s(iFlt,iProb,jInten) + hHw*epsilon1
+C                     epsilon-independent terms: applied once per rupture after the GMM loop
+                      hHsum(jInten) = hHsum(jInten) + hHw
+                      goto 510
+                    endif
+C *** END SPEEDUP EDIT
+
 c                   Loop over parameter variations (epistemic)
                     do 500 iParam=1,nParamVar(iFlt,iFltWidth)
 
@@ -540,6 +670,13 @@ c                    Set the weight for this set of parameters (epistemic)
 
 c                    Set up weight array for later output.
                      wtout(iFlt,iParam,iFltWidth,iFtype) = wt
+
+C *** SPEEDUP EDIT (Stage 1, zero-pMag branch skip): p1 = 0 for this branch, so
+C     every term accumulated below (Haz, deagg, tempHaz, tempHaz1, tempHaz2,
+C     p1_sum) would add exactly zero.
+                     if ( sourceType(iFlt) .ne. 7 .and.
+     1                    pMag(iParam,iFltWidth) .eq. 0. ) goto 500
+C *** END SPEEDUP EDIT
 
 c                    Set probability of this earthquake (w/o gm) - (aleatory)
                      p1 = pMag(iParam,iFltWidth)*pArea*pWidth*pLocX*pLocY(iLocY)
@@ -576,7 +713,8 @@ c                    Add marginal rate of exceed to total
                      Haz(jInten,iProb,iFlt) = Haz(jInten,iProb,iFlt) + mHaz*wt1
 
                      HazBins(iMagBin,iDistBin,iEpsBin,iProb,jInten) =
-     1                      HazBins(iMagBin,iDistBin,iEpsBin,iProb,jInten) + real(mHaz*wt1)
+C *** PRECISION EDIT: add in double precision (was  + real(mHaz*wt1) )
+     1                      HazBins(iMagBin,iDistBin,iEpsBin,iProb,jInten) + mHaz*wt1
 
 c  Note: directivity deaggregation was removed from this version
 c                     should wt be modified to wt1?
@@ -644,6 +782,33 @@ c                     Sum up the weighted PC coeff for each PC Coeff
  540             continue
  549            continue
  550           continue
+C *** SPEEDUP EDIT (Stage 2): epsilon-independent hazard and deaggregation
+C     sums for this rupture (all multipliers are fixed for the rupture)
+               if ( sourceType(iFlt) .ne. 7 .and. PCflag(iProb) .eq. 0 ) then
+                do jInten=1,nInten(iProb)
+                 hHw = hHsum(jInten)
+                 if ( hHw .ne. 0.d0 ) then
+                  Haz(jInten,iProb,iFlt) = Haz(jInten,iProb,iFlt) + hHw
+                  m_bar(iProb,jInten) = m_bar(iProb,jInten) + hHw*magTotal
+                  d_bar(iProb,jInten) = d_bar(iProb,jInten) + hHw*distRup
+                  Xcost_bar(iProb,jInten) = Xcost_bar(iProb,jInten) + hHw*Xcost
+                  m_bar_s(iFlt,iProb,jInten) = m_bar_s(iFlt,iProb,jInten) + hHw*magTotal
+                  rrup_bar_s(iFlt,iProb,jInten) = rrup_bar_s(iFlt,iProb,jInten) + hHw*distRup
+                  rjb_bar_s(iFlt,iProb,jInten) = rjb_bar_s(iFlt,iProb,jInten) + hHw*distjb
+                  rx_bar_s(iFlt,iProb,jInten) = rx_bar_s(iFlt,iProb,jInten) + hHw*Rx
+                  rSeismo_bar_s(iFlt,iProb,jInten) = rSeismo_bar_s(iFlt,iProb,jInten) + hHw*distseismo
+                  ry0_bar_s(iFlt,iProb,jInten) = ry0_bar_s(iFlt,iProb,jInten) + hHw*ry0
+                  rHypo_bar_s(iFlt,iProb,jInten) = rHypo_bar_s(iFlt,iProb,jInten) + hHw*disthypo
+                  hypodepth_bar_s(iFlt,iProb,jInten) = hypodepth_bar_s(iFlt,iProb,jInten) + hHw*hypodepth
+                  Ztor_bar_s(iFlt,iProb,jInten) = Ztor_bar_s(iFlt,iProb,jInten) + hHw*Ztor
+                  thetasite_bar_s(iFlt,iProb,jInten) = thetasite_bar_s(iFlt,iProb,jInten) + hHw*theta_site
+                  rupwidth_bar_s(iFlt,iProb,jInten) = rupwidth_bar_s(iFlt,iProb,jInten) + hHw*rupwidth
+                  dipavgd_bar_s(iFlt,iProb,jInten) = dipavgd_bar_s(iFlt,iProb,jInten) + hHw*dipavgd
+                  ftype_bar_s(iFlt,iProb,jInten) = ftype_bar_s(iFlt,iProb,jInten) + hHw*ftype(iFlt,iFtype)
+                 endif
+                enddo
+               endif
+C *** END SPEEDUP EDIT
  560          continue
  561          continue
  600         continue
@@ -651,6 +816,33 @@ c                     Sum up the weighted PC coeff for each PC Coeff
  651        continue
  700       continue
  750      continue
+
+C *** SPEEDUP EDIT (Stage 2): apply this magnitude's sums to the branch-resolved
+C     fractile arrays:  tempHaz  += hRate(iParam)*sum(pRock*pAleat)
+C                       tempHaz1 += hRate(iParam)*gm_wt*sum(pRock*pAleat)
+          if ( hUsed ) then
+            jType = attenType(iFlt)
+            do iFtype=1,nFtype(iFlt)
+             do iProb=1,nProb
+              do iAtten=1,nAtten(iProb,jType)
+               do jInten=1,nInten(iProb)
+                hQ = hG(jInten,iProb,iAtten,iFtype)
+                if ( hQ .ne. 0.d0 ) then
+                 hHw = hQ*gm_wt(iProb,jType,iAtten)
+                 do iParam=1,nParamVar(iFlt,iFltWidth)
+                  tempHaz(iParam,jInten,iProb,iAtten,iFtype) = hRate(iParam)*hQ
+     1                     + tempHaz(iParam,jInten,iProb,iAtten,iFtype)
+                  tempHaz1(iParam,jInten,iProb,iFtype) = hRate(iParam)*hHw
+     1                     + tempHaz1(iParam,jInten,iProb,iFtype)
+                 enddo
+                 hG(jInten,iProb,iAtten,iFtype) = 0.d0
+                endif
+               enddo
+              enddo
+             enddo
+            enddo
+          endif
+C *** END SPEEDUP EDIT
 
 c         Compute the rate for this magnitude for each epistemic parameter variation
           do iParam=1,nParamVar(iFlt,iFltWidth)
